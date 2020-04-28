@@ -1,0 +1,6 @@
+.mypy_cache/
+.vscode/
+proc_gen.egg-info/
+Dockerfile
+.gitignore
+README.md

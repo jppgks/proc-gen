@@ -1,0 +1,264 @@
+#!/usr/bin/env python
+# Copyright (c) 2020-2021 Joppe Geluykens
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+import contextlib
+import json
+import os
+import logging
+import sys
+from argparse import Namespace
+from collections import Counter
+from multiprocessing import Pool, Queue
+from pathlib import Path
+
+import click
+from tqdm import *
+
+from proc_gen import data, Problem, TASK_TO_PROBLEMS
+from proc_gen.data.schema import PARTITIONS
+from proc_gen.data.multiprocessing_bpe_encoder import MultiprocessingEncoder
+
+logger = logging.getLogger("prepare_data")
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.setLevel(logging.INFO)
+
+LOADER_AND_PARSER_AND_TOKENIZER = {
+    "Recipe1M": (
+        lambda input_file: json.load(open(input_file, "r")),
+        data.recipe1m_to_procedure,
+        "moses",
+    ),
+    "dummy": (lambda _: range(100), data.dummy_to_procedure, "moses"),
+}
+
+
+@click.command()
+@click.option(
+    "--input-path",
+    default="/data/procgen/v1/source/Recipe1M/layer1.json",
+    help="File containing the input procedures (target product, requirements, tasks).",
+)
+@click.option(
+    "--output-dir",
+    default="/data/procgen/v1/processed",
+    help="Base dir for saving the processed train/val/test files.",
+)
+@click.option(
+    "--bpe-dir",
+    help="Directory containing BPE vocabulary and encoder files.",
+    default=os.environ["BPE_DIR"],
+)
+@click.option(
+    "--dataset",
+    type=click.Choice(["Recipe1M", "dummy"]),
+    help="Type of the dataset provided through --input_file.",
+)
+@click.option(
+    "--problem", type=click.Choice(Problem.__members__.keys()),
+)
+@click.option(
+    "--model-type",
+    type=click.Choice(["onmt", "huggingface", "fairseq"]),
+    help="Which modeling library to prepare the data for.",
+)
+@click.option("--no_tokenize", is_flag=True, help="Do not apply tokenization.")
+def prepare_data(
+    input_path: str,
+    output_dir: str,
+    bpe_dir: str,
+    dataset: str,
+    problem: str,
+    model_type: str,
+    no_tokenize: bool,
+):
+    """
+    Writes src and tgt files for train/val/test sets to `output_dir`
+    """
+    logger.info(
+        f"Running data preparation with input path {input_path}, output dir {output_dir} and dataset {dataset} "
+        f"for problem {problem} and model type {model_type}."
+    )
+
+    if problem == "Requirements_TO_TargetProduct":
+        problem = Problem.Requirements_TO_TargetProduct
+    elif problem == "TargetProduct_TO_Requirements":
+        problem = Problem.TargetProduct_TO_Requirements
+    elif problem == "Requirements_TO_TargetProductAndTasks":
+        problem = Problem.Requirements_TO_TargetProductAndTasks
+    elif problem == "TargetProductAndRequirements_TO_Tasks":
+        problem = Problem.TargetProductAndRequirements_TO_Tasks
+    elif problem == "TargetProductAndRequirementsAndTasks":
+        problem = Problem.TargetProductAndRequirementsAndTasks
+    elif problem == "RequirementsAndTargetProductAndTasks":
+        problem = Problem.RequirementsAndTargetProductAndTasks
+    elif problem == "RequirementsAndTargetProductShuffle":
+        problem = Problem.RequirementsAndTargetProductShuffle
+
+    # Get dataset iterable
+    #   + example parser to Procedure
+    load_data, parse_procedure, tokenizer = LOADER_AND_PARSER_AND_TOKENIZER[dataset]
+    dataset_iterable = load_data(input_path)
+
+    # Create output directory
+    #   (e.g.: output_dir/Requirements_TO_TargetProduct/Recipe1M/fairseq)
+    output_dir = Path(output_dir) / problem.name / dataset / model_type
+    if output_dir.exists():
+        raise FileExistsError(f"Directory {str(output_dir)} already exists.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}.")
+
+    if model_type == "onmt":
+        raise NotImplementedError("OpenNMT models are not yet supported.")
+    elif model_type == "huggingface":
+        raise NotImplementedError("HuggingFace models are not yet supported.")
+    elif model_type == "fairseq":
+        # Prepare data
+        if problem in TASK_TO_PROBLEMS["language_modeling"]:
+            langs = [problem.name]
+        else:
+            langs = problem.name.replace("_", "").split("TO")
+
+        with contextlib.ExitStack() as stack:
+            partition_to_files = {
+                part: [
+                    stack.enter_context(open(output_dir / f"{part}.{lang}", "wt"))
+                    for lang in langs
+                ]
+                for part in PARTITIONS
+            }
+
+            for i, entry in enumerate(tqdm(dataset_iterable)):
+                # Parse dataset entry to Procedure
+                if "Shuffle" in problem.name:
+                    proc, partition, curr_problem = parse_procedure(entry)
+                    curr_problem = Problem[curr_problem]
+                else:
+                    curr_problem = problem
+                    proc, partition = parse_procedure(entry)
+
+                # Convert Procedure to translation example
+                example = data.procedure_to_example(proc, curr_problem)
+
+                # Tokenize example
+                if not no_tokenize:
+                    example = data.tokenize_example(example, tokenizer)
+
+                # Write to files
+                partition_to_files[partition][0].write(f"{example.src}\n")
+                if problem in TASK_TO_PROBLEMS["translation"]:
+                    partition_to_files[partition][1].write(f"{example.tgt}\n")
+
+        # BPE encode
+        for part in PARTITIONS:
+            inputs = [output_dir / f"{part}.{lang}" for lang in langs]
+            outputs = [
+                output_dir
+                / f'{part}.bpe{"." + lang if problem is not Problem.TargetProductAndRequirementsAndTasks else ""}'
+                for lang in langs
+            ]
+            logger.info(f"Encoding {inputs}, {outputs}")
+            # encode
+            tok_args = Namespace(
+                encoder_json=f"{bpe_dir}/encoder.json",
+                vocab_bpe=f"{bpe_dir}/vocab.bpe",
+                inputs=inputs,
+                outputs=outputs,
+                keep_empty=True,
+                workers=60,
+            )
+            fairseq_encode(tok_args)
+            # store decoded for reference
+            tok_args.inputs = outputs
+            tok_args.outputs = [f"{o}.decoded" for o in outputs]
+            fairseq_encode(tok_args, decode=True)
+
+        # Preprocess/binarize
+        from fairseq_cli import preprocess
+        from fairseq.options import get_preprocessing_parser
+
+        parser = get_preprocessing_parser()
+
+        preprocess_args = parser.parse_args([])  # get default args
+        if problem in TASK_TO_PROBLEMS["language_modeling"]:
+            preprocess_args.task = "language_modeling"
+            preprocess_args.only_source = True
+        else:
+            preprocess_args.task = "translation"
+            preprocess_args.source_lang = langs[0]
+            preprocess_args.target_lang = langs[1]
+            preprocess_args.joined_dictionary = True
+
+        # Pretrained BART:
+        # preprocess_args.srcdict = '.../ckpts/procgen/v1/processed/Requirements_TO_TargetProductAndTasks/Recipe1M/fairseq/bart.large.cnn/dict.source.txt'
+        # preprocess_args.tgtdict = '.../ckpts/procgen/v1/processed/Requirements_TO_TargetProductAndTasks/Recipe1M/fairseq/bart.large.cnn/dict.target.txt'
+
+        # preprocess_args.destdir = output_dir / "data-bin/tokenized-gpt2"
+        preprocess_args.destdir = output_dir / "data-bin/tokenized"
+
+        preprocess_args.trainpref = str(output_dir / "train")  # train.bpe train
+        preprocess_args.validpref = str(output_dir / "valid")  # valid.bpe valid
+        preprocess_args.testpref = str(output_dir / "test")  # test.bpe test
+
+        # preprocess_args.workers = 120
+
+        preprocess.main(preprocess_args)
+
+    logger.info(f"Wrote output to {output_dir}: {list(output_dir.iterdir())}")
+
+
+def fairseq_encode(args: Namespace, decode=False):
+    # Copyright (c) Facebook, Inc. and its affiliates.
+    # The code in this function is licensed under the MIT license.
+    with contextlib.ExitStack() as stack:
+        inputs = [
+            stack.enter_context(open(input, "r", encoding="utf-8"))
+            if input != "-"
+            else sys.stdin
+            for input in args.inputs
+        ]
+        outputs = [
+            stack.enter_context(open(output, "w", encoding="utf-8"))
+            if output != "-"
+            else sys.stdout
+            for output in args.outputs
+        ]
+
+        encoder = MultiprocessingEncoder(args)
+        pool = Pool(args.workers, initializer=encoder.initializer)
+        if not decode:
+            processed_lines = pool.imap(encoder.encode_lines, zip(*inputs), 100)
+        else:
+            processed_lines = pool.imap(encoder.decode_lines, zip(*inputs), 100)
+
+        stats = Counter()
+        for i, (filt, enc_lines) in enumerate(processed_lines, start=1):
+            if filt == "PASS":
+                for enc_line, output_h in zip(enc_lines, outputs):
+                    print(enc_line, file=output_h)
+            else:
+                stats["num_filtered_" + filt] += 1
+            if i % 10000 == 0:
+                print("processed {} lines".format(i), file=sys.stderr)
+
+        for k, v in stats.most_common():
+            print("[{}] filtered {} lines".format(k, v), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    prepare_data()

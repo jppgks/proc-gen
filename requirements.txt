@@ -1,0 +1,7 @@
+click~=7.1
+vizseq==0.1.15
+bert-score==0.3.2
+pandas==1.1.5
+sacremoses==0.0.35
+numpy==1.20.0
+git+https://github.com/pytorch/fairseq@1e40a48037eefc5ceb7672ea0fa11db629a35113

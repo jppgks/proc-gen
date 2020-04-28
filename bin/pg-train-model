@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+import logging
+import os
+import random
+import sys
+from pathlib import Path
+
+import click
+
+import torch
+from proc_gen.utils import get_ckpt_dir
+
+logger = logging.getLogger("train_model")
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.setLevel(logging.INFO)
+
+ARCH_PARAM_TO_STRING = {
+    "lstm": "lstm",
+    "conv": "fconv_wmt_en_de",
+    "transformer": "transformer_iwslt_de_en",  #'transformer_wmt_en_de', transformer_wmt_en_de_big
+    "bart": "bart_large",
+    "gpt2": "transformer_lm_gpt2_small",  # 124M param model
+}
+
+
+def fairseq_train(train_args):
+    # Copyright (c) Facebook, Inc. and its affiliates.
+    # The code in this function is licensed under the MIT license.
+    from fairseq_cli import train
+
+    if train_args.distributed_init_method is not None:
+        # distributed training
+        if torch.cuda.device_count() > 1 and not train_args.distributed_no_spawn:
+            start_rank = train_args.distributed_rank
+            train_args.distributed_rank = None  # assign automatically
+            torch.multiprocessing.spawn(
+                fn=train.distributed_main,
+                args=(train_args, start_rank),
+                nprocs=torch.cuda.device_count(),
+            )
+        else:
+            train.distributed_main(train_args.device_id, train_args)
+    elif train_args.distributed_world_size > 1:
+        # single node with multiple GPUs
+        assert train_args.distributed_world_size <= torch.cuda.device_count()
+        port = random.randint(10000, 20000)
+        train_args.distributed_init_method = "tcp://localhost:{port}".format(port=port)
+        train_args.distributed_rank = None  # set based on device id
+        logger.info(f"Spawning {train_args.distributed_world_size} processes.")
+        torch.multiprocessing.spawn(
+            fn=train.distributed_main,
+            args=(train_args,),
+            nprocs=train_args.distributed_world_size,
+        )
+    else:
+        train.main(train_args)
+
+
+@click.command()
+@click.option(
+    "--data_dir",
+    default=".../data/procgen/v1/processed",
+    help="Base dir for saving the processed train/val/test files.",
+)
+@click.option(
+    "--dataset",
+    type=click.Choice(["Recipe1M", "dummy"]),
+    help="Type of the dataset provided through --input_file.",
+)
+@click.option(
+    "--problem", type=click.Choice(Problem.__members__.keys()),
+)
+@click.option(
+    "--model_type",
+    type=click.Choice(["onmt", "huggingface", "fairseq"]),
+    help="Which modeling library to use.",
+)
+@click.option(
+    "--model_arch",
+    type=click.Choice(["lstm", "conv", "transformer", "bart", "gpt2"]),
+    help="Which model architecture to use.",
+)
+@click.option(
+    "--warm_start", is_flag=True, help="If provided, start from existing checkpoint.",
+)
+@click.option("--local_rank", type=int, default=0, help="Passed by torch.distributed.")
+@click.option("--version", type=int, default=None, help=".")
+@click.option(
+    "--task",
+    type=click.Choice(["translation", "denoising", "language_modeling"]),
+    default="translation",
+    help="Which training task to perform.",
+)
+@click.option(
+    "--log_mlflow", is_flag=True, help="If provided, log to MLFlow.",
+)
+def train_model(
+    data_dir,
+    dataset,
+    problem,
+    model_type,
+    model_arch,
+    warm_start,
+    local_rank,
+    version,
+    task,
+    log_mlflow,
+):
+    if model_type in ("onmt", "huggingface"):
+        raise NotImplementedError(f"TODO: implement {model_type}")
+
+    data_dir = Path(data_dir) / problem / dataset / model_type
+
+    if model_type == "fairseq":
+        input_dir = data_dir / "data-bin/tokenized"
+        assert input_dir.exists()
+
+        from proc_gen.configs import bart_conf, dummy_conf, gpt2_conf, transformer_conf
+
+        ARCH_PARAM_TO_CONF = {
+            "lstm": dummy_conf,
+            "conv": dummy_conf,
+            "transformer": transformer_conf,
+            "bart": bart_conf,
+            "gpt2": gpt2_conf,
+        }
+        train_conf = ARCH_PARAM_TO_CONF[model_arch]
+
+        model_arch = ARCH_PARAM_TO_STRING[model_arch]
+
+        ckpt_dir = get_ckpt_dir(data_dir, model_arch, version)
+        if ckpt_dir.exists() and not warm_start:
+            raise FileExistsError(
+                f"Asked not to warm start. Remove existing ckpt dir: rm -rf {str(ckpt_dir)}"
+            )
+        ckpt_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(f"Checkpoint dir: {str(ckpt_dir)}")
+
+        from fairseq import distributed_utils, options
+        from fairseq_cli import train
+
+        parser = options.get_training_parser()
+
+        train_args = options.parse_args_and_arch(
+            parser, input_args=[str(input_dir), "--arch", model_arch, "--task", task,],
+        )
+        train_args = train_conf.add_train_args(train_args)
+
+        # train_args = model_conf.add_denoising_args(train_args)
+
+        train_args.save_dir = str(ckpt_dir)
+        # train_args.save_interval = 1
+        train_args.save_interval_updates = 500
+
+        # train_args.cpu = True
+        # train_args.num_workers = 6
+        train_args.fix_batches_to_gpus = True
+
+        train_args.reset_optimizer = True
+        train_args.reset_dataloader = True
+        train_args.reset_lr_scheduler = True
+        train_args.reset_meters = True
+
+        # train_args.fp16 = True
+        # train_args.memory_efficient_fp16 = True
+
+        train_args.no_progress_bar = True
+        train_args.log_interval = 1
+
+        train_args.skip_invalid_size_inputs_valid_test = True
+
+        train_args.distributed_no_spawn = True
+        train_args.device_id = local_rank
+        train_args.local_rank = local_rank
+        train_args.ddp_backend = "no_c10d"
+
+        if train_args.distributed_init_method is None:
+            distributed_utils.infer_init_method(train_args)
+
+        if log_mlflow:
+            import mlflow
+
+            # if os.environ["NODE_RANK"] == "0" and os.environ["RANK"] == "0":
+            mlflow.set_tracking_uri("http://localhost:5007")
+            mlflow.set_experiment("/procgen")
+            mlflow.start_run()
+
+            mlflow.set_tag("problem", problem)
+            mlflow.set_tag("model_arch", model_arch)
+            mlflow.set_tag("dataset", dataset)
+
+            mlflow.log_param("data_dir", str(input_dir))
+            mlflow.log_param("ckpt_dir", str(ckpt_dir))
+            mlflow.log_param("dataset", dataset)
+            mlflow.log_param("problem", problem)
+            mlflow.log_param("model_type", model_type)
+            mlflow.log_param("model_arch", model_arch)
+            mlflow.log_param("warm_start", warm_start)
+
+            for arg in vars(train_args):
+                mlflow.log_param(arg, getattr(train_args, arg))
+
+        fairseq_train(train_args)
+
+        if log_mlflow:
+            # if os.environ["NODE_RANK"] == "0" and os.environ["RANK"] == "0":
+            mlflow.end_run()
+
+
+if __name__ == "__main__":
+    train_model()

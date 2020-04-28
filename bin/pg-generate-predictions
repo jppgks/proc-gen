@@ -1,0 +1,131 @@
+#!/usr/bin/env python
+# Copyright (c) 2020-2021 Joppe Geluykens
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+import logging
+import sys
+import time
+from pathlib import Path
+
+import click
+from proc_gen import Problem
+from proc_gen.utils import get_ckpt_dir, replace_in_path
+
+logger = logging.getLogger("generate")
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.propagate = False
+logger.setLevel(logging.INFO)
+
+ARCH_PARAM_TO_STRING = {
+    "lstm": "lstm",
+    "conv": "fconv_wmt_en_de",
+    "transformer": "transformer_iwslt_de_en",  #'transformer_wmt_en_de', transformer_wmt_en_de_big
+    "bart": "bart_large",
+    "gpt2": "transformer_lm_gpt2_small",  # 124M param model
+}
+
+
+@click.command()
+@click.option(
+    "--data_dir",
+    default="/data/procgen/v1/processed",
+    help="Base dir for saving the processed train/val/test files.",
+)
+@click.option(
+    "--dataset",
+    type=click.Choice(["Recipe1M", "dummy"]),
+    help="Type of the dataset provided through --input_file.",
+)
+@click.option(
+    "--problem", type=click.Choice(Problem.__members__.keys()),
+)
+@click.option(
+    "--model_type",
+    type=click.Choice(["onmt", "huggingface", "fairseq"]),
+    help="Which modeling library to use.",
+)
+@click.option(
+    "--model_arch",
+    type=click.Choice(["lstm", "conv", "transformer", "bart", "gpt2"]),
+    help="Which model architecture to use.",
+)
+@click.option(
+    "--version", type=int, default=0, help="Which version of the data to use."
+)
+@click.option("--shard_id", type=int, default=0, help="Which shard to generate.")
+def generate(data_dir, dataset, problem, model_type, model_arch, version, shard_id):
+
+    data_dir = Path(data_dir) / problem / dataset / model_type
+    ckpt_dir = get_ckpt_dir(data_dir, ARCH_PARAM_TO_STRING[model_arch], version)
+    results_dir: Path = replace_in_path(data_dir, "data", "results") / model_arch
+    results_dir.mkdir(exist_ok=True, parents=True)
+
+    if model_type == "fairseq":
+        from fairseq_cli import generate
+        from fairseq.options import get_generation_parser, parse_args_and_arch
+
+        def predict_test_set():
+            parser = get_generation_parser()
+
+            data_arg = str(data_dir / "data-bin/tokenized")  # tokenized-gpt2
+
+            generate_args = parse_args_and_arch(parser, input_args=[data_arg])
+
+            generate_args.path = str(ckpt_dir / "checkpoint_best.pt")
+
+            results_path = (
+                results_dir / f"{model_arch}-on-{generate_args.gen_subset}-{shard_id}"
+            )
+            logger.info(f"Writing evaluate results to {str(results_path)}")
+            generate_args.results_path = str(results_path)
+
+            generate_args.beam = 10  # 1
+            # generate_args.nbest = 3
+            # generate_args.lenpen = 1.2
+            # generate_args.min_len = 60
+
+            # generate_args.joined_dictionary = True
+            # generate_args.srcdict = 'bart.large.cnn/dict.source.txt'
+            # generate_args.tgtdict = 'bart.large.cnn/dict.target.txt'
+
+            # generate_args.bpe = 'gpt2'
+            # generate_args.gpt2_encoder_json = 'gpt2_bpe/encoder.json'
+            # generate_args.gpt2_vocab_bpe = 'gpt2_bpe/vocab.bpe'
+            # generate_args.remove_bpe = '@@ '
+
+            generate_args.max_source_positions = 2048
+            generate_args.max_target_positions = 2048
+
+            generate_args.skip_invalid_size_inputs_valid_test = True
+
+            # generate_args.num_workers = 60
+            # generate_args.num_shards = 100
+            # generate_args.shard_id = shard_id
+
+            generate.main(generate_args)
+
+    else:
+        raise NotImplementedError(f"TODO: Implement results for {model_type}")
+
+    start = time.time()
+    predict_test_set()
+    logger.info(f"Time elapsed: {time.time() - start}")
+
+
+if __name__ == "__main__":
+    generate()
